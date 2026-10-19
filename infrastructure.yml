@@ -1,5 +1,5 @@
 ```yaml
-AWSTemplateFormatVersion: '2026-19-10'
+AWSTemplateFormatVersion: '2010-09-09'
 
 Description: >
   Version 0.2 - Capstone AWS Application.
