@@ -1,0 +1,322 @@
+```yaml
+AWSTemplateFormatVersion: '2026-19-10'
+
+Description: >
+  Version 0.2 - Capstone AWS Application.
+  Provides a DynamoDB table, Lambda function, and API Gateway
+  with a POST /submit endpoint.
+
+Parameters:
+  ECRImage:
+    Type: String
+    Description: ECR image URI for the ECS web application
+
+Resources:
+
+  # ---------------------------------------------------------
+  # DynamoDB Table
+  # ---------------------------------------------------------
+  DynamoDBTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: CapstoneTable
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+
+  # ---------------------------------------------------------
+  # Lambda Execution Role
+  # ---------------------------------------------------------
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: CapstoneLambdaExecutionRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+
+      Policies:
+        - PolicyName: LambdaDynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                Resource: !GetAtt DynamoDBTable.Arn
+
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+
+  # ---------------------------------------------------------
+  # Lambda Function
+  # ---------------------------------------------------------
+  CrudLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: CapstoneSubmitFunction
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 256
+
+      Environment:
+        Variables:
+          DYNAMODB_TABLE: !Ref DynamoDBTable
+
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import uuid
+          import boto3
+
+          dynamodb = boto3.resource("dynamodb")
+          table = dynamodb.Table(os.environ["DYNAMODB_TABLE"])
+
+
+          def lambda_handler(event, context):
+
+              try:
+                  # API Gateway sends the request body here
+                  body = event.get("body", "{}")
+
+                  if isinstance(body, str):
+                      body = json.loads(body)
+
+                  # Generate a unique submission ID
+                  submission_id = str(uuid.uuid4())
+
+                  # Store submission in DynamoDB
+                  item = {
+                      "id": submission_id,
+                      "data": body
+                  }
+
+                  table.put_item(Item=item)
+
+                  return {
+                      "statusCode": 200,
+                      "headers": {
+                          "Content-Type": "application/json"
+                      },
+                      "body": json.dumps({
+                          "message": "Submission received successfully",
+                          "submissionId": submission_id
+                      })
+                  }
+
+              except Exception as error:
+
+                  return {
+                      "statusCode": 500,
+                      "headers": {
+                          "Content-Type": "application/json"
+                      },
+                      "body": json.dumps({
+                          "error": str(error)
+                      })
+                  }
+
+  # ---------------------------------------------------------
+  # Lambda CloudWatch Log Group
+  # ---------------------------------------------------------
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${CrudLambdaFunction}
+      RetentionInDays: 7
+
+  # ---------------------------------------------------------
+  # API Gateway REST API
+  # ---------------------------------------------------------
+  CapstoneAPI:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: CapstoneSubmitAPI
+      Description: Version 0.2 POST submission API
+
+  # ---------------------------------------------------------
+  # /submit Resource
+  # ---------------------------------------------------------
+  SubmitResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref CapstoneAPI
+      ParentId: !GetAtt CapstoneAPI.RootResourceId
+      PathPart: submit
+
+  # ---------------------------------------------------------
+  # POST /submit Method
+  # ---------------------------------------------------------
+  SubmitPostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref CapstoneAPI
+      ResourceId: !Ref SubmitResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${CrudLambdaFunction.Arn}/invocations
+
+  # ---------------------------------------------------------
+  # Allow API Gateway to Invoke Lambda
+  # ---------------------------------------------------------
+  LambdaApiGatewayPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref CrudLambdaFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub
+        arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${CapstoneAPI}/*/POST/submit
+
+  # ---------------------------------------------------------
+  # API Gateway Deployment
+  # ---------------------------------------------------------
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - SubmitPostMethod
+    Properties:
+      RestApiId: !Ref CapstoneAPI
+
+  # ---------------------------------------------------------
+  # API Gateway Stage
+  # ---------------------------------------------------------
+  ApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref CapstoneAPI
+      DeploymentId: !Ref ApiDeployment
+      StageName: prod
+
+  # ---------------------------------------------------------
+  # ECS Cluster
+  # ---------------------------------------------------------
+  MyECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: CapstoneCluster
+
+  # ---------------------------------------------------------
+  # ECS Execution Role
+  # ---------------------------------------------------------
+  ECSTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: CapstoneECSTaskExecutionRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ecs-tasks.amazonaws.com
+            Action:
+              - sts:AssumeRole
+
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  # ---------------------------------------------------------
+  # ECS Task Definition
+  # ---------------------------------------------------------
+  MyTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: CapstoneWebTask
+      RequiresCompatibilities:
+        - FARGATE
+      NetworkMode: awsvpc
+      Cpu: '256'
+      Memory: '512'
+
+      ExecutionRoleArn: !GetAtt ECSTaskExecutionRole.Arn
+
+      ContainerDefinitions:
+        - Name: webapp-container
+          Image: !Ref ECRImage
+
+          PortMappings:
+            - ContainerPort: 80
+              Protocol: tcp
+
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: /ecs/capstone-web-app
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+
+  # ---------------------------------------------------------
+  # ECS CloudWatch Log Group
+  # ---------------------------------------------------------
+  ECSLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /ecs/capstone-web-app
+      RetentionInDays: 7
+
+
+Outputs:
+
+  # ---------------------------------------------------------
+  # DynamoDB
+  # ---------------------------------------------------------
+  DynamoDBTableName:
+    Description: DynamoDB table name
+    Value: !Ref DynamoDBTable
+
+  # ---------------------------------------------------------
+  # Lambda
+  # ---------------------------------------------------------
+  LambdaFunctionName:
+    Description: Lambda function name
+    Value: !Ref CrudLambdaFunction
+
+  LambdaFunctionArn:
+    Description: Lambda function ARN
+    Value: !GetAtt CrudLambdaFunction.Arn
+
+  # ---------------------------------------------------------
+  # API Gateway
+  # ---------------------------------------------------------
+  ApiEndpoint:
+    Description: POST /submit API endpoint
+    Value: !Sub
+      https://${CapstoneAPI}.execute-api.${AWS::Region}.amazonaws.com/prod/submit
+
+  # ---------------------------------------------------------
+  # ECS
+  # ---------------------------------------------------------
+  ECSClusterName:
+    Description: ECS cluster name
+    Value: !Ref MyECSCluster
+
+  ECSTaskDefinition:
+    Description: ECS task definition
+    Value: !Ref MyTaskDefinition
+```
